@@ -39,16 +39,7 @@ def generate_input(m: int, n: int, k: int, seed: int) -> input_t:
     return (a.T, b.T, a_scale.T, b_scale.T, c)
     
     
-a,b,a_s,b_s,c = generate_input(4,4,4, 0)
-'''
-print("A",a)
-print("B",b)
 
-print("a scale", a_s)
-print("b scale", b_s)
-
-print(c)
-'''
 def custom_kernel(data: input_t) -> output_t:
     """
     Reference implementation of block-scale fp8 gemm 
@@ -86,11 +77,11 @@ def custom_kernel(data: input_t) -> output_t:
     a_scale = a_scale[:, :k]
 
     # Dequantize 'a', in your implementation you should do this at the end.
-    print(a)
-    print(a_scale)
+    #print(a)
+    #print(a_scale)
     a = a.to(a_scale.dtype) * a_scale 
-    print(a)
-    print(a.dtype)
+    #print(a)
+    #print(a.dtype)
     # Apply scaling to input 'b'
     b_scale = (
         b_scale.view(-1, 1)
@@ -100,135 +91,201 @@ def custom_kernel(data: input_t) -> output_t:
         .reshape(scale_n * block_shape_n, scale_k * block_shape_k)
     )
     b_scale = b_scale[:n, :k]
-    print(b)
-    print(b_scale)
+    #print(b)
+    #print(b_scale)
     # Dequantize 'b', in your implementation you should do this at the end.
     b = b.to(b_scale.dtype) * b_scale 
-    print(b)
+    #print(b)
     c[...] = (a @ b.T).to(torch.bfloat16)
     return c
 
+@triton.autotune(
+    configs=[
+        triton.Config({'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE_M': 1}, num_stages=3, num_warps=8),
+        triton.Config({'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 64, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE_M': 4}, num_stages=4, num_warps=4),
+    ],
+    key=['M', 'N', 'K'],
+)
+
+
 @triton.jit
-def fp8_gemm_kernel(
+def matmul_kernel(
     # ??????
     a_ptr, b_ptr, c_ptr,
-    a_scale_ptr, b_scale_ptr,
     # ????
-    m, n, k,
-    # ??(????)
-    stride_am, stride_ak,
-    stride_bn, stride_bk,
-    stride_cm, stride_cn,
-    stride_a_scale_m, stride_a_scale_k,
-    stride_b_scale_n, stride_b_scale_k,
-    # ????(????)
-    BLOCK_SIZE_M: tl.constexpr, BLOCK_SIZE_N: tl.constexpr, BLOCK_SIZE_K: tl.constexpr,
+    M, N, K,
+    # ??(??????)
+    stride_am, stride_ak,  # A???(???)
+    stride_bk, stride_bn,  # B???(???)
+    stride_cm, stride_cn,  # C???
+    # ???
+    BLOCK_SIZE_M: tl.constexpr,
+    BLOCK_SIZE_N: tl.constexpr,
+    BLOCK_SIZE_K: tl.constexpr,
+    GROUP_SIZE_M: tl.constexpr,  #
+    #ACTIVATION: tl.constexpr  #
 ):
-    # ??????????
-    pid_m = tl.program_id(0)
-    pid_n = tl.program_id(1)
+    pid = tl.program_id(axis=0)
+    num_pid_m = tl.cdiv(M, BLOCK_SIZE_M)
+    num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
+    num_pid_in_group = GROUP_SIZE_M * num_pid_n
+    group_id = pid // num_pid_in_group
+    first_pid_m = group_id * GROUP_SIZE_M
+    group_size_m = min(num_pid_m - first_pid_m, GROUP_SIZE_M)
+    pid_m = first_pid_m + ((pid % num_pid_in_group) % group_size_m)
+    pid_n = (pid % num_pid_in_group) // group_size_m
     
-    # ???????/???
-    offs_m = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
-    offs_n = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+    offs_am = (pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)) % M
+    offs_bn = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)) % N
     offs_k = tl.arange(0, BLOCK_SIZE_K)
+    a_ptrs = a_ptr + (offs_am[:, None]*stride_am + offs_k [None, :]*stride_ak)
+    b_ptrs = b_ptr + (offs_k [:, None]*stride_bk + offs_bn[None, :]*stride_bn)
     
-    # ??????(BF16)
-    accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.bfloat16)
+    accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+    for k in range(0, K,BLOCK_SIZE_K):
+        a = tl.load(a_ptrs, mask = offs_k[None, :] + k < K, other = 0.0)  # load 1 row A (block k length)
+        b = tl.load(b_ptrs, mask = offs_k[:, None] + k < K, other = 0.0)  # 1 col
+        accumulator += tl.dot(a,b)
+        a_ptrs += BLOCK_SIZE_K * stride_ak
+        b_ptrs += BLOCK_SIZE_K * stride_bk
+    #if ACTIVATION == "leaky_relu":
+    #    accumulator = leaky_relu(accumulator)
+    c = accumulator.to(tl.float16)
     
-    # ???? GEMM
-    for k_block in range(0, k, BLOCK_SIZE_K):
-        # ?? A ???(FP8 -> FP16)
-        a_offs = offs_m[:, None] * stride_am + (offs_k + k_block)[None, :] * stride_ak
-        a_mask = (offs_m[:, None] < m) & ((offs_k + k_block)[None, :] < k)
-        a_fp8 = tl.load(a_ptr + a_offs, mask=a_mask, other=0)
-        
-        # ?? A ?????
-        a_scale_offs = (offs_m[:, None] // 128) * stride_a_scale_m + \
-                       ((offs_k + k_block)[None, :] // 128) * stride_a_scale_k
-        a_scale = tl.load(a_scale_ptr + a_scale_offs, mask=a_mask, other=1.0)
-        
-        # ?? A ? FP16:FP8 * scale
-        a_fp16 = (a_fp8.to(tl.float16) * a_scale).to(tl.bfloat16)
-        
-        # ?? B ???(FP8 -> FP16)
-        b_offs = (offs_k + k_block)[:, None] * stride_bk + offs_n[None, :] * stride_bn
-        b_mask = ((offs_k + k_block)[:, None] < k) & (offs_n[None, :] < n)
-        b_fp8 = tl.load(b_ptr + b_offs, mask=b_mask, other=0)
-        
-        # ?? B ?????
-        b_scale_offs = ((offs_k + k_block)[:, None] // 128) * stride_b_scale_k + \
-                       (offs_n[None, :] // 128) * stride_b_scale_n
-        b_scale = tl.load(b_scale_ptr + b_scale_offs, mask=b_mask, other=1.0)
-        
-        # ?? B ? FP16:FP8 * scale
-        b_fp16 = (b_fp8.to(tl.float16) * b_scale).to(tl.bfloat16)
-        
-        # ????????
-        accumulator += tl.dot(a_fp16, b_fp16)
     
-    # ????? C(BF16)
-    c_offs = offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn
-    c_mask = (offs_m[:, None] < m) & (offs_n[None, :] < n)
-    tl.store(c_ptr + c_offs, accumulator, mask=c_mask)
-
-def fp8_gemm(
-    #a: torch.Tensor,  # [m, k], float8_e4m3fnuz
-    #b: torch.Tensor,  # [n, k], float8_e4m3fnuz
-    #a_scale: torch.Tensor,  # [m, k // 128], float32
-    #b_scale: torch.Tensor,  # [n // 128, k // 128], float32
-    #c: torch.Tensor,  # [m, n], bfloat16
-    data: input) -> output_t: 
-
+    offs_cm = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
+    offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+    c_ptrs = c_ptr + (offs_cm[:, None]*stride_cm + offs_cn [None, :]*stride_cn)
+    tl.store(c_ptrs,c,mask = (offs_cm[:, None] < M) & (offs_cn[None, :] < N) )
+ 
+    
+def custom_kernel2(data: input_t) -> output_t:
+    """
+    Reference implementation of block-scale fp8 gemm 
+    Args:
+        data: Tuple that expands to:
+            a: torch.Tensor[float8_e4m3fnuz] of shape [m, k], 
+            b: torch.Tensor[float8_e4m3fnuz] of shape [n, k], 
+            a_scale: torch.Tensor[float32] of shape [m, k // 128], 
+            b_scale: torch.Tensor[float32] of shape [n // 128, k // 128], 
+            c: torch.Tensor[bfloat16] of shape [m, n]
+    Returns:
+        Tensor containing output in bf16
+    """
+    # c: [m, n] is pre-allocated memory to avoid timing allocation overhead.
     a, b, a_scale, b_scale, c = data
+    
+    # a is M x K in column-major order, we convert here for simplicity.
     a = a.contiguous()
     
     a_scale = a_scale.contiguous()
     b_scale = b_scale.contiguous()
     
-    assert a.is_contiguous() and b.is_contiguous()
-    assert a_scale.is_contiguous() and b_scale.is_contiguous()
-    assert c.is_contiguous()
+    # constants
+    m = a.shape[0]
+    n = b.shape[0]
+    k = a.shape[1]
+    block_shape_n = 128
+    block_shape_k = 128
+    scale_n = b_scale.shape[0]
+    scale_k = b_scale.shape[1]
+
+    # Apply scaling to input 'a'
+    a_scale = a_scale.unsqueeze(-1).repeat(1, 1, block_shape_k)  # Shape: [m, scale_k, block_shape_k]
+    a_scale = a_scale.reshape(m, scale_k * block_shape_k) 
+    a_scale = a_scale[:, :k]
+
+    # Dequantize 'a', in your implementation you should do this at the end.
+    a = a.to(a_scale.dtype) * a_scale 
     
-    m, k = a.shape
-    n, _ = b.shape
+    # Apply scaling to input 'b'
+    b_scale = (
+        b_scale.view(-1, 1)
+        .repeat(1, block_shape_n * block_shape_k)
+        .view(scale_n, scale_k, block_shape_n, block_shape_k)
+        .permute(0, 2, 1, 3)  # Reorder dimensions: [scale_n, blk_n, scale_k, blk_k]
+        .reshape(scale_n * block_shape_n, scale_k * block_shape_k)
+    )
+    b_scale = b_scale[:n, :k]
     
-    # ??????(?????)
-    BLOCK_SIZE_M = 64
-    BLOCK_SIZE_N = 64
-    BLOCK_SIZE_K = 32
+    # Dequantize 'b', in your implementation you should do this at the end.
+    b = b.to(b_scale.dtype) * b_scale 
+    b = b.T
     
-    # ??????
-    grid = (triton.cdiv(m, BLOCK_SIZE_M), triton.cdiv(n, BLOCK_SIZE_N))
+    #c[...] = (a @ b.T).to(torch.bfloat16)
+    M, K = a.shape
+    N, _ = b.shape
+    
+
     
     # ????
-    fp8_gemm_kernel[grid](
-        a, b, c,
-        a_scale, b_scale,
-        m, n, k,
-        a.stride(0), a.stride(1),
-        b.stride(0), b.stride(1),
-        c.stride(0), c.stride(1),
-        a_scale.stride(0), a_scale.stride(1),
-        b_scale.stride(0), b_scale.stride(1),
-        BLOCK_SIZE_M=BLOCK_SIZE_M,
-        BLOCK_SIZE_N=BLOCK_SIZE_N,
-        BLOCK_SIZE_K=BLOCK_SIZE_K,
+    grid = lambda META: (triton.cdiv(M, META['BLOCK_SIZE_M']) * triton.cdiv(N, META['BLOCK_SIZE_N']), )
+    matmul_kernel[grid](
+        a, b, c,  #
+        M, N, K,  #
+        a.stride(0), a.stride(1),  #
+        b.stride(0), b.stride(1),  #
+        c.stride(0), c.stride(1)  #
+        
     )
+    c = c.to(torch.bfloat16)
     return c
     
+
     
     
-data = generate_input(2,3,4, 0)
+    
+
+data = generate_input(2,3,4,0)
+a, b, a_scale, b_scale, c = data
+#print(a, b, a_scale, b_scale, c)
+
+
+print("exeu:")
 torch_output = custom_kernel(data)
 print(torch_output)
 
-#triton_output = fp8_gemm(data)
-#print(triton_output)
-'''
+triton_output = custom_kernel2(data)
+print(triton_output)
+
 rtol = 1e-2 
 if torch.allclose(triton_output, torch_output, atol=1e-2, rtol=rtol):
     print("YES Triton and Torch match")
 else:
     print("NO Triton and Torch differ")  
-'''
+    
+    
+
+@triton.testing.perf_report(
+    triton.testing.Benchmark(
+        x_names=['N'],  # argument names to use as an x-axis for the plot 用作图表 x 轴的参数名
+        x_vals=[128 * i for i in range(2, 10)],  # different possible values for `x_name` `x_name` 的不同可能值
+        line_arg='provider',  # argument name whose value corresponds to a different line in the plot 参数名，其值对应于图表中不同线条
+        line_vals=['triton', 'torch'],  # possible values for `line_arg`` `line_arg` 的可能值
+        line_names=[
+            "Triton",
+            "Torch",
+        ],  # label name for the lines 线条的标签名称
+        styles=[('blue', '-'), ('green', '-')],  # line styles 线条的样式
+        ylabel="GB/s",  # label name for the y-axis y 轴的标签名称
+        plot_name="softmax-performance",  # name for the plot. Used also as a file name for saving the plot. 图表的名称，也用作保存图表的文件名
+        args={'M': 4096, 'K': 4096},  # values for function arguments not in `x_names` and `y_name` `x_names` 和 `y_name` 中未包含的函数参数的值
+    ))
+def benchmark(M, N, K,provider):
+    #x = torch.randn(M, K, device='cuda', dtype=torch.float32)
+    #y = torch.randn(K, N, device='cuda', dtype=torch.float32)
+    data = generate_input(M,N,K,0)
+    x , y, x_s, y_s , c = data
+    stream = torch.cuda.Stream()
+    torch.cuda.set_stream(stream)
+    if provider == 'torch':
+        ms = triton.testing.do_bench(lambda: custom_kernel(data))
+    if provider == 'triton':
+        ms = triton.testing.do_bench(lambda: custom_kernel2(data))
+    gbps = lambda ms: 3 * x.nelement() * y.element_size() * 1e-9 / (ms * 1e-3)
+    return gbps(ms)
+    
+benchmark.run(show_plots=True, print_data=True)
+
+
+
