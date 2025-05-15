@@ -69,6 +69,7 @@ class MoE(nn.Module):
                                             flat_expert_weights)
 
         routed_output = routed_output_flat.view(*orig_shape)
+        print("forward")
         return routed_output + shared_output
 
     @torch.no_grad()
@@ -99,7 +100,7 @@ class MoE(nn.Module):
                 expert_out,
                 reduce='sum'
             )
-
+        print("moe infer")
         return expert_cache
 
 
@@ -244,7 +245,7 @@ def generate_input(
 
 #check_implementation = make_match_reference(ref_kernel, rtol=1e-2, atol=1e-2)
 
-input_tensor, weights, config = generate_input(
+data = generate_input(
     dhidden =2,
     dexpert = 2,
     nroutedexperts = 2,
@@ -254,6 +255,7 @@ input_tensor, weights, config = generate_input(
     seqlen = 5,
     seed = 0
 ) 
+input_tensor, weights, config  = data
 print("____________________input_tensor________________________")
 print(input_tensor)
 print("______________________weights______________________")
@@ -261,3 +263,5 @@ print(weights)
 print("______________________config______________________")
 print(config)
 
+output = ref_kernel(data)
+print(output)
